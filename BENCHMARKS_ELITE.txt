@@ -1,0 +1,5 @@
+-----------------------------------------------------------------------------
+Benchmark                   Time             CPU   Iterations UserCounters...
+-----------------------------------------------------------------------------
+BM_WriteThroughput 1290880197 ns   1282033000 ns            1 items_per_second=78.0011k/s
+BM_ReadThroughput  9661219735 ns   9260654000 ns            1 items_per_second=21.5967k/s

@@ -1,4 +1,6 @@
 file(REMOVE_RECURSE
+  "CMakeFiles/heliosdb.dir/src/bloom.cpp.o"
+  "CMakeFiles/heliosdb.dir/src/bloom.cpp.o.d"
   "CMakeFiles/heliosdb.dir/src/db.cpp.o"
   "CMakeFiles/heliosdb.dir/src/db.cpp.o.d"
   "CMakeFiles/heliosdb.dir/src/sstable.cpp.o"

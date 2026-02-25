@@ -202,6 +202,30 @@ benchmarks/lsm_bench.cpp.s:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/lsm_bench.dir/build.make CMakeFiles/lsm_bench.dir/benchmarks/lsm_bench.cpp.s
 .PHONY : benchmarks/lsm_bench.cpp.s
 
+src/bloom.o: src/bloom.cpp.o
+.PHONY : src/bloom.o
+
+# target to build an object file
+src/bloom.cpp.o:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/heliosdb.dir/build.make CMakeFiles/heliosdb.dir/src/bloom.cpp.o
+.PHONY : src/bloom.cpp.o
+
+src/bloom.i: src/bloom.cpp.i
+.PHONY : src/bloom.i
+
+# target to preprocess a source file
+src/bloom.cpp.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/heliosdb.dir/build.make CMakeFiles/heliosdb.dir/src/bloom.cpp.i
+.PHONY : src/bloom.cpp.i
+
+src/bloom.s: src/bloom.cpp.s
+.PHONY : src/bloom.s
+
+# target to generate assembly for a file
+src/bloom.cpp.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/heliosdb.dir/build.make CMakeFiles/heliosdb.dir/src/bloom.cpp.s
+.PHONY : src/bloom.cpp.s
+
 src/db.o: src/db.cpp.o
 .PHONY : src/db.o
 
@@ -338,6 +362,9 @@ help:
 	@echo "... benchmarks/lsm_bench.o"
 	@echo "... benchmarks/lsm_bench.i"
 	@echo "... benchmarks/lsm_bench.s"
+	@echo "... src/bloom.o"
+	@echo "... src/bloom.i"
+	@echo "... src/bloom.s"
 	@echo "... src/db.o"
 	@echo "... src/db.i"
 	@echo "... src/db.s"

@@ -7,7 +7,7 @@
 #include <sstream>
 #include <algorithm>
 #include <iomanip>
-#include <unordered_map>
+#include <limits>
 
 using namespace std;
 
@@ -24,9 +24,25 @@ HeliosDB::HeliosDB(const std::string& data_dir)
 
     wal_ = std::make_unique<WAL>(data_directory_ + "/wal.log");
     wal_->replay(*this);
+
+    // background compaction thread
+    bg_ = std::thread([this] { bg_loop_(); });
 }
 
-HeliosDB::~HeliosDB() { close(); }
+HeliosDB::~HeliosDB() {
+    close();
+}
+
+void HeliosDB::close() {
+    // stop background thread
+    stop_.store(true);
+    {
+        std::lock_guard<std::mutex> lk(bg_mu_);
+        compact_requested_.store(true);
+    }
+    cv_.notify_all();
+    if (bg_.joinable()) bg_.join();
+}
 
 size_t HeliosDB::kv_bytes_(const std::string& k, const std::optional<std::string>& v) {
     return k.size() + (v ? v->size() : 0) + 16;
@@ -82,6 +98,7 @@ std::optional<std::string> HeliosDB::get(const std::string& key) {
         }
     }
 
+    // newest -> oldest
     for (const auto& sst : sstables_) {
         auto v = sst->get(key);
         if (v.has_value()) {
@@ -94,7 +111,9 @@ std::optional<std::string> HeliosDB::get(const std::string& key) {
 }
 
 void HeliosDB::maybe_flush_unsafe_() {
-    if (memtable_bytes_ >= kMaxMemtableBytes) flush_unsafe_();
+    if (memtable_bytes_ >= kMaxMemtableBytes) {
+        flush_unsafe_();
+    }
 }
 
 std::string HeliosDB::make_sstable_filename_(uint64_t id) const {
@@ -103,7 +122,7 @@ std::string HeliosDB::make_sstable_filename_(uint64_t id) const {
     return oss.str();
 }
 
-std::vector<std::string> HeliosDB::current_manifest_files_() const {
+std::vector<std::string> HeliosDB::read_manifest_files_() const {
     std::vector<std::string> files;
     std::ifstream in(manifest_path_);
     std::string line;
@@ -130,9 +149,8 @@ void HeliosDB::load_manifest_and_sstables_() {
         return;
     }
 
-    auto files = current_manifest_files_();
+    auto files = read_manifest_files_();
 
-    // compute next id
     for (const auto& f : files) {
         if (starts_with(f, "sst_") && f.size() >= 10) {
             std::string num = f.substr(4, 6);
@@ -142,7 +160,6 @@ void HeliosDB::load_manifest_and_sstables_() {
         }
     }
 
-    // load valid tables only, newest first
     std::vector<std::unique_ptr<SSTable>> loaded;
     for (const auto& f : files) {
         std::string path = data_directory_ + "/" + f;
@@ -153,13 +170,21 @@ void HeliosDB::load_manifest_and_sstables_() {
     std::reverse(loaded.begin(), loaded.end());
     sstables_ = std::move(loaded);
 
-    // rewrite manifest removing missing/corrupt entries
+    // clean manifest
     std::vector<std::string> cleaned;
     for (const auto& f : files) {
         std::string path = data_directory_ + "/" + f;
         if (std::filesystem::exists(path) && SSTable::is_valid(path)) cleaned.push_back(f);
     }
     if (cleaned != files) write_manifest_atomic_(cleaned);
+}
+
+void HeliosDB::request_compaction_() {
+    {
+        std::lock_guard<std::mutex> lk(bg_mu_);
+        compact_requested_.store(true);
+    }
+    cv_.notify_one();
 }
 
 void HeliosDB::flush_unsafe_() {
@@ -173,24 +198,19 @@ void HeliosDB::flush_unsafe_() {
     entries.reserve(memtable_.size());
     for (const auto& [k, v] : memtable_) entries.push_back({k, v});
 
-    // atomic write + validate
     SSTable::write_atomic(path, entries);
 
-    // update manifest atomically
-    auto files = current_manifest_files_();
+    auto files = read_manifest_files_();
     files.push_back(filename);
     write_manifest_atomic_(files);
 
-    // add table newest-first
     sstables_.insert(sstables_.begin(), std::make_unique<SSTable>(path));
 
-    // clear memtable + reset WAL (data now durable in SSTable)
     memtable_.clear();
     memtable_bytes_ = 0;
     wal_->reset();
 
-    // optional: compact if too many tables
-    if (sstables_.size() >= 8) compact();
+    if (sstables_.size() >= kCompactThreshold) request_compaction_();
 }
 
 void HeliosDB::flush() {
@@ -199,39 +219,53 @@ void HeliosDB::flush() {
 }
 
 void HeliosDB::compact() {
-    // size-tiered: merge newest 4 tables into 1
-    if (sstables_.size() < 4) return;
+    request_compaction_();
+}
 
-    const size_t kMergeN = 4;
+void HeliosDB::bg_loop_() {
+    std::unique_lock<std::mutex> lk(bg_mu_);
+    while (!stop_.load()) {
+        cv_.wait(lk, [&] { return stop_.load() || compact_requested_.load(); });
+        if (stop_.load()) break;
+        compact_requested_.store(false);
 
-    // Load manifest list
-    auto files = current_manifest_files_();
-    // files are oldest->newest in manifest; but our sstables_ is newest->oldest.
-    // We will merge the newest kMergeN files: last kMergeN in manifest.
-    if (files.size() < kMergeN) return;
+        lk.unlock();
+        // do one merge at a time
+        compact_once_();
+        lk.lock();
+    }
+}
 
+void HeliosDB::compact_once_() {
+    // Snapshot manifest files under DB lock
+    std::vector<std::string> files;
+    {
+        std::unique_lock lock(mutex_);
+        files = read_manifest_files_();
+        if (files.size() < kMergeN) return;
+    }
+
+    // Merge newest kMergeN files: last kMergeN in manifest (manifest oldest->newest)
     std::vector<std::string> merge_files(files.end() - kMergeN, files.end());
 
-    // Multi-way merge using map (lean and correct)
-    std::map<std::string, std::optional<std::string>> merged; // newest wins by applying in order
-    // Apply from oldest->newest among the selected tables to make newest win
+    // Build merged map (oldest->newest so newest wins)
+    std::map<std::string, std::optional<std::string>> merged;
+    const uint32_t TOMBSTONE = std::numeric_limits<uint32_t>::max();
+
     for (const auto& f : merge_files) {
         std::string p = data_directory_ + "/" + f;
-        SSTable t(p);
+        if (!std::filesystem::exists(p) || !SSTable::is_valid(p)) continue;
 
-        // brute scan: since we don't have iterator yet, we reconstruct by reading file sequentially
-        // lean approach: re-open as raw parse using SSTable::get isn't enough for full scan.
-        // So: we re-parse the file here.
         std::ifstream in(p, std::ios::binary);
         if (!in.is_open()) continue;
 
         auto total = std::filesystem::file_size(p);
-        uint64_t end = static_cast<uint64_t>(total - sizeof(uint64_t) - sizeof(uint32_t)); // footer size (magic+checksum)
-        uint64_t off = 0;
+        uint64_t end = static_cast<uint64_t>(total - sizeof(uint64_t) - sizeof(uint32_t)); // footer
 
+        uint64_t off = 0;
         while (off < end) {
             in.seekg(static_cast<std::streamoff>(off), std::ios::beg);
-            uint32_t ksize = 0, vsize = 0;
+            uint32_t ksize=0, vsize=0;
             in.read(reinterpret_cast<char*>(&ksize), 4);
             if (!in) break;
             in.read(reinterpret_cast<char*>(&vsize), 4);
@@ -242,7 +276,7 @@ void HeliosDB::compact() {
             in.read(key.data(), ksize);
             if (!in) break;
 
-            if (vsize == std::numeric_limits<uint32_t>::max()) {
+            if (vsize == TOMBSTONE) {
                 merged[key] = std::nullopt;
                 off = static_cast<uint64_t>(in.tellg());
             } else {
@@ -250,15 +284,22 @@ void HeliosDB::compact() {
                 std::string val(vsize, '\0');
                 in.read(val.data(), vsize);
                 if (!in) break;
-                merged[key] = val;
+                merged[key] = std::move(val);
                 off = static_cast<uint64_t>(in.tellg());
             }
         }
     }
 
-    const uint64_t id = next_sst_id_++;
-    const std::string out_file = make_sstable_filename_(id);
-    const std::string out_path = data_directory_ + "/" + out_file;
+    // Write new merged SSTable
+    uint64_t new_id = 0;
+    std::string out_file;
+    std::string out_path;
+    {
+        std::unique_lock lock(mutex_);
+        new_id = next_sst_id_++;
+        out_file = make_sstable_filename_(new_id);
+        out_path = data_directory_ + "/" + out_file;
+    }
 
     std::vector<std::pair<std::string, std::optional<std::string>>> entries;
     entries.reserve(merged.size());
@@ -266,18 +307,22 @@ void HeliosDB::compact() {
 
     SSTable::write_atomic(out_path, entries);
 
-    // Remove merged files from manifest, append new one
-    std::vector<std::string> new_manifest(files.begin(), files.end() - kMergeN);
-    new_manifest.push_back(out_file);
-    write_manifest_atomic_(new_manifest);
+    // Install: rewrite manifest + delete old files + reload sstables (under lock)
+    {
+        std::unique_lock lock(mutex_);
 
-    // Delete old files on disk
-    for (const auto& f : merge_files) {
-        std::filesystem::remove(data_directory_ + "/" + f);
+        auto cur = read_manifest_files_();
+        if (cur.size() < kMergeN) return;
+
+        std::vector<std::string> new_manifest(cur.begin(), cur.end() - kMergeN);
+        new_manifest.push_back(out_file);
+        write_manifest_atomic_(new_manifest);
+
+        for (const auto& f : merge_files) {
+            std::filesystem::remove(data_directory_ + "/" + f);
+            std::filesystem::remove(data_directory_ + "/" + f + ".bloom");
+        }
+
+        load_manifest_and_sstables_();
     }
-
-    // Reload sstables from manifest (simple and safe)
-    load_manifest_and_sstables_();
 }
-
-void HeliosDB::close() {}

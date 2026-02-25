@@ -91,7 +91,7 @@ void WAL::replay(HeliosDB& db) {
     while (true) {
         WalHeader hdr{};
         in.read(reinterpret_cast<char*>(&hdr), sizeof(hdr));
-        if (!in) break; // EOF cleanly
+        if (!in) break;
 
         // Basic sanity checks to prevent insane allocations on corruption
         if (hdr.total_len < sizeof(WalHeader)) break;
@@ -137,7 +137,7 @@ void WAL::replay(HeliosDB& db) {
 
         const uint32_t chk = fnv1a_32(buf.data(), buf.size());
         if (chk != hdr.checksum) {
-            // Corrupt record => stop safely (do NOT apply garbage)
+            // Corrupt record x stop safely ,do NOT apply garbage
             break;
         }
 

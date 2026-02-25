@@ -15,13 +15,11 @@
 
 using namespace std;
 
-static constexpr uint32_t TOMBSTONE_VSIZE = std::numeric_limits<uint32_t>::max();
 static constexpr uint64_t FOOTER_MAGIC = 0x48454C494F535354ULL; // "HELIOSST"
-
 #pragma pack(push, 1)
 struct Footer {
     uint64_t magic;
-    uint32_t checksum;
+    uint32_t checksum; // FNV-1a over records region
 };
 #pragma pack(pop)
 
@@ -71,49 +69,114 @@ bool SSTable::is_valid(const std::string& path) {
     return chk == f.checksum;
 }
 
+std::string SSTable::bloom_path_for(const std::string& sstable_path) {
+    return sstable_path + ".bloom";
+}
+
 SSTable::SSTable(const std::string& path)
     : path_(path)
 {
-    if (!is_valid(path_)) return;
+    valid_ = SSTable::is_valid(path_);
+    if (!valid_) return;
 
-    std::ifstream in(path_, std::ios::binary);
-    if (!in.is_open()) return;
+#if defined(__unix__) || defined(__APPLE__)
+    fd_ = ::open(path_.c_str(), O_RDONLY);
+    if (fd_ < 0) { valid_ = false; return; }
+#else
+    valid_ = false;
+    return;
+#endif
 
     auto total = std::filesystem::file_size(path_);
-    uint64_t end = static_cast<uint64_t>(total - sizeof(Footer));
+    end_ = static_cast<uint64_t>(total - sizeof(Footer));
 
+    // Load bloom sidecar if exists
+    bool ok = false;
+    bloom_ = BloomFilter::load(bloom_path_for(path_), ok);
+    bloom_ok_ = ok;
+
+    // Build sparse index via single scan using pread
     uint64_t offset = 0;
     uint32_t count = 0;
 
-    while (offset < end) {
-        in.seekg(offset);
-
+    while (offset < end_) {
         uint32_t ksize = 0, vsize = 0;
-        in.read(reinterpret_cast<char*>(&ksize), sizeof(ksize));
-        if (!in) break;
-        in.read(reinterpret_cast<char*>(&vsize), sizeof(vsize));
-        if (!in) break;
+        if (!pread_all(&ksize, 4, offset)) break;
+        if (!pread_all(&vsize, 4, offset + 4)) break;
 
-        if (offset + 8ULL + ksize > end) break;
+        if (offset + 8ULL + ksize > end_) break;
 
         std::string key(ksize, '\0');
-        in.read(key.data(), ksize);
-        if (!in) break;
+        if (ksize && !pread_all(key.data(), ksize, offset + 8)) break;
 
+        uint64_t next = offset + 8ULL + ksize;
         if (vsize != TOMBSTONE_VSIZE) {
-            if (offset + 8ULL + ksize + vsize > end) break;
-            in.seekg(vsize, std::ios::cur);
-            if (!in) break;
+            if (next + vsize > end_) break;
+            next += vsize;
         }
 
         if (count % kIndexStride == 0) {
             index_.push_back({key, offset});
         }
         count++;
-
-        offset = static_cast<uint64_t>(in.tellg());
-        if (in.fail()) break;
+        offset = next;
     }
+}
+
+SSTable::~SSTable() {
+#if defined(__unix__) || defined(__APPLE__)
+    if (fd_ >= 0) ::close(fd_);
+#endif
+}
+
+bool SSTable::pread_all(void* buf, size_t n, uint64_t off) const {
+#if defined(__unix__) || defined(__APPLE__)
+    uint8_t* p = reinterpret_cast<uint8_t*>(buf);
+    size_t got = 0;
+    while (got < n) {
+        ssize_t r = ::pread(fd_, p + got, n - got, static_cast<off_t>(off + got));
+        if (r <= 0) return false;
+        got += static_cast<size_t>(r);
+    }
+    return true;
+#else
+    (void)buf; (void)n; (void)off;
+    return false;
+#endif
+}
+
+bool SSTable::read_record_at(
+    uint64_t offset,
+    std::string& out_key,
+    std::optional<std::string>& out_value,
+    uint64_t& out_next_offset
+) const {
+    if (!valid_) return false;
+    if (offset >= end_) return false;
+
+    uint32_t ksize = 0, vsize = 0;
+    if (!pread_all(&ksize, 4, offset)) return false;
+    if (!pread_all(&vsize, 4, offset + 4)) return false;
+
+    if (offset + 8ULL + ksize > end_) return false;
+
+    out_key.assign(ksize, '\0');
+    if (ksize && !pread_all(out_key.data(), ksize, offset + 8)) return false;
+
+    uint64_t pos = offset + 8ULL + ksize;
+    if (vsize == TOMBSTONE_VSIZE) {
+        out_value = std::nullopt;
+        out_next_offset = pos;
+        return true;
+    }
+
+    if (pos + vsize > end_) return false;
+
+    std::string val(vsize, '\0');
+    if (vsize && !pread_all(val.data(), vsize, pos)) return false;
+    out_value = std::move(val);
+    out_next_offset = pos + vsize;
+    return true;
 }
 
 void SSTable::write_atomic(
@@ -126,11 +189,16 @@ void SSTable::write_atomic(
     if (!out.is_open()) throw std::runtime_error("Failed to open SSTable tmp");
 
     uint32_t chk = 2166136261u;
-
     auto fnv_feed = [&](const void* p, size_t n) {
         const uint8_t* b = reinterpret_cast<const uint8_t*>(p);
         for (size_t i = 0; i < n; ++i) { chk ^= b[i]; chk *= 16777619u; }
     };
+
+    // Build bloom for this table (tunable):
+    // 10 bits/key, 7 hashes is a common-ish baseline.
+    const uint32_t m_bits = static_cast<uint32_t>(entries.size() * 10ULL);
+    const uint32_t k_hash = 7;
+    BloomFilter bloom(m_bits ? m_bits : 8u, k_hash);
 
     for (const auto& [k, v] : entries) {
         uint32_t ksize = static_cast<uint32_t>(k.size());
@@ -143,6 +211,8 @@ void SSTable::write_atomic(
         fnv_feed(&ksize, 4);
         fnv_feed(&vsize, 4);
         fnv_feed(k.data(), ksize);
+
+        bloom.add(k);
 
         if (vsize != TOMBSTONE_VSIZE) {
             out.write(v->data(), v->size());
@@ -158,54 +228,23 @@ void SSTable::write_atomic(
     fsync_file(tmp);
     std::filesystem::rename(tmp, final_path);
     fsync_file(final_path);
-}
 
-bool SSTable::read_record_at(
-    const std::string& path,
-    uint64_t offset,
-    std::string& out_key,
-    std::optional<std::string>& out_value,
-    uint64_t& out_next_offset
-) {
-    if (!is_valid(path)) return false;
-
-    auto total = std::filesystem::file_size(path);
-    uint64_t end = total - sizeof(Footer);
-    if (offset >= end) return false;
-
-    std::ifstream in(path, std::ios::binary);
-    if (!in.is_open()) return false;
-
-    in.seekg(offset);
-
-    uint32_t ksize = 0, vsize = 0;
-    in.read(reinterpret_cast<char*>(&ksize), 4);
-    if (!in) return false;
-    in.read(reinterpret_cast<char*>(&vsize), 4);
-    if (!in) return false;
-
-    if (offset + 8ULL + ksize > end) return false;
-
-    out_key.assign(ksize, '\0');
-    in.read(out_key.data(), ksize);
-    if (!in) return false;
-
-    if (vsize == TOMBSTONE_VSIZE) {
-        out_value = std::nullopt;
-    } else {
-        if (offset + 8ULL + ksize + vsize > end) return false;
-        std::string val(vsize, '\0');
-        in.read(val.data(), vsize);
-        if (!in) return false;
-        out_value = std::move(val);
-    }
-
-    out_next_offset = static_cast<uint64_t>(in.tellg());
-    return !in.fail();
+    // Write bloom sidecar atomically too
+    const std::string bloom_path = bloom_path_for(final_path);
+    const std::string bloom_tmp = bloom_path + ".tmp";
+    bloom.save(bloom_tmp);
+    fsync_file(bloom_tmp);
+    std::filesystem::rename(bloom_tmp, bloom_path);
+    fsync_file(bloom_path);
 }
 
 std::optional<std::optional<std::string>> SSTable::get(const std::string& key) const {
-    if (index_.empty()) return std::nullopt;
+    if (!valid_ || index_.empty()) return std::nullopt;
+
+    // Bloom fast negative
+    if (bloom_ok_ && !bloom_.possibly_contains(key)) {
+        return std::nullopt;
+    }
 
     auto it = std::upper_bound(
         index_.begin(), index_.end(), key,
@@ -220,11 +259,10 @@ std::optional<std::optional<std::string>> SSTable::get(const std::string& key) c
         std::optional<std::string> v;
         uint64_t next = 0;
 
-        if (!read_record_at(path_, off, k, v, next)) break;
+        if (!read_record_at(off, k, v, next)) break;
         if (k == key) return v;
         if (k > key) return std::nullopt;
         off = next;
     }
-
     return std::nullopt;
 }

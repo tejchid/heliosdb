@@ -1,2 +1,2 @@
-/usr/bin/ar qc libheliosdb.a CMakeFiles/heliosdb.dir/src/db.cpp.o CMakeFiles/heliosdb.dir/src/wal.cpp.o CMakeFiles/heliosdb.dir/src/sstable.cpp.o
+/usr/bin/ar qc libheliosdb.a CMakeFiles/heliosdb.dir/src/db.cpp.o CMakeFiles/heliosdb.dir/src/wal.cpp.o CMakeFiles/heliosdb.dir/src/sstable.cpp.o CMakeFiles/heliosdb.dir/src/bloom.cpp.o
 /usr/bin/ranlib libheliosdb.a

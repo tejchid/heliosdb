@@ -5,4 +5,4 @@
 # This file includes the relevant testing commands required for 
 # testing this directory and lists subdirectories to be tested as well.
 add_test(BasicTest "/Users/tejjchid/heliosdb/build/basic_test")
-set_tests_properties(BasicTest PROPERTIES  _BACKTRACE_TRIPLES "/Users/tejjchid/heliosdb/CMakeLists.txt;27;add_test;/Users/tejjchid/heliosdb/CMakeLists.txt;0;")
+set_tests_properties(BasicTest PROPERTIES  _BACKTRACE_TRIPLES "/Users/tejjchid/heliosdb/CMakeLists.txt;28;add_test;/Users/tejjchid/heliosdb/CMakeLists.txt;0;")

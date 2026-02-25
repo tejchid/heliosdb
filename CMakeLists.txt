@@ -16,6 +16,7 @@ add_library(heliosdb
     src/db.cpp
     src/wal.cpp
     src/sstable.cpp
+    src/bloom.cpp
 )
 
 add_executable(main src/main.cpp)
@@ -25,8 +26,8 @@ enable_testing()
 add_executable(basic_test tests/basic_test.cpp)
 target_link_libraries(basic_test heliosdb)
 add_test(NAME BasicTest COMMAND basic_test)
+
 # ---- Benchmarks ----
 find_package(benchmark REQUIRED)
-
 add_executable(lsm_bench benchmarks/lsm_bench.cpp)
 target_link_libraries(lsm_bench heliosdb benchmark::benchmark)
