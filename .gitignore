@@ -1,0 +1,7 @@
+build/
+data/
+data_test/
+bench_data/
+*.tmp
+*.log
+.DS_Store
